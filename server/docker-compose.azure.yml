@@ -1,0 +1,78 @@
+# Azure Blob / ADLS Gen2 backend (Azurite as the local emulator).
+# Compose overlay: docker compose -f docker-compose.yml -f docker-compose.azure.yml up -d
+#
+# Caveat: Azurite implements the Blob API completely and ADLS Gen2 (DFS API)
+# only partially. This is fine for the tiered-storage smoke path but some
+# hierarchical-namespace operations may fail. Swap in a real Azure account
+# for anything beyond a lab.
+
+services:
+  kafka:
+    depends_on:
+      - iceberg-rest
+      - azurite
+    environment:
+      "KAFKA_RSM_CONFIG_ICEBERG_CATALOG_IO-IMPL": org.apache.iceberg.azure.adlsv2.ADLSFileIO
+      # Warehouse uses the ADLS Gen2 URI scheme (abfss://filesystem@account.dfs...).
+      KAFKA_RSM_CONFIG_ICEBERG_CATALOG_WAREHOUSE: abfss://kafka-tiered@devstoreaccount1.dfs.core.windows.net/
+      # Point the Azure SDK at Azurite via a Blob connection string.
+      "KAFKA_RSM_CONFIG_ICEBERG_CATALOG_ADLS_CONNECTION-STRING_DEVSTOREACCOUNT1": >-
+        DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
+
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.10.0
+    hostname: iceberg-rest
+    container_name: sense-iceberg-rest
+    depends_on:
+      - azurite
+      - bucket-init
+    ports:
+      - "8181:8181"
+    environment:
+      CATALOG_WAREHOUSE: abfss://kafka-tiered@devstoreaccount1.dfs.core.windows.net/
+      CATALOG_IO__IMPL: org.apache.iceberg.azure.adlsv2.ADLSFileIO
+      CATALOG_ADLS_CONNECTION__STRING_DEVSTOREACCOUNT1: >-
+        DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
+    restart: unless-stopped
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.32.0
+    hostname: azurite
+    container_name: sense-azurite
+    ports:
+      - "10000:10000"
+      - "10001:10001"
+      - "10002:10002"
+    command:
+      - azurite
+      - --blobHost
+      - "0.0.0.0"
+      - --queueHost
+      - "0.0.0.0"
+      - --tableHost
+      - "0.0.0.0"
+      - --skipApiVersionCheck
+      - --loose
+      - --location
+      - /data
+    volumes:
+      - ${DATA_ROOT:-./data}/azurite:/data
+    restart: unless-stopped
+
+  bucket-init:
+    image: mcr.microsoft.com/azure-cli:2.63.0
+    container_name: sense-bucket-init
+    depends_on:
+      - azurite
+    environment:
+      AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+          az storage container create --name kafka-tiered && break
+          echo "waiting for Azurite ($i)..."; sleep 2
+        done
+        az storage container list --query '[].name' -o tsv
+    restart: on-failure

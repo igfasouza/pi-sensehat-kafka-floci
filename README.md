@@ -26,13 +26,22 @@ Log out/in after group changes. The Sense HAT talks over I2C, so make sure I2C i
 cd server/kafka/plugins && ./fetch.sh && cd -
 cd server
 cp .env.example .env
+# .env picks the object-store backend via COMPOSE_FILE (s3 / gcs / azure).
 docker compose up -d
 ```
 
-Kafka: `localhost:9092`
-Floci: `http://localhost:4566`
+Common: Kafka `localhost:9092`, Karapace `http://localhost:8081`, Iceberg REST `http://localhost:8181`.
 
-The `bucket-init` sidecar creates `s3://kafka-tiered` in Floci automatically.
+Backend-specific emulator endpoints:
+
+| Backend | Emulator            | Endpoint                     |
+|---------|---------------------|------------------------------|
+| S3      | Floci               | `http://localhost:4566`      |
+| GCS     | fake-gcs-server     | `http://localhost:4443`      |
+| Azure   | Azurite             | `http://localhost:10000`     |
+
+The `bucket-init` sidecar of each overlay creates the `kafka-tiered` bucket /
+container on the emulator — that doubles as the Iceberg warehouse.
 
 ## 3. Create Kafka topic
 
@@ -50,7 +59,7 @@ mvn -q package
 sudo -E java -jar target/sense-producer.jar
 ```
 
-`sudo` is typically required for I2C access unless your user has the right group membership. The producer sends temperature, humidity, pressure and accelerometer readings to `sensehat`.
+`sudo` is typically required for I2C access unless your user has the right group membership. The producer sends temperature, humidity, pressure and accelerometer readings to `sensehat` as **Avro** records — the schema is registered with Karapace on first publish. Set `SCHEMA_REGISTRY_URL` if Karapace isn't on `http://localhost:8081`.
 
 ### LED matrix status display
 
@@ -80,25 +89,29 @@ mvn -q package
 java -jar target/live-consumer.jar
 ```
 
-## 6. Check Floci S3
-
-Install AWS CLI if needed, then:
+## 6. Check the object store
 
 ```bash
+# S3 / Floci
 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
-aws --region us-east-1 --endpoint-url http://localhost:4566 s3 mb s3://kafka-tiered
+  aws --region us-east-1 --endpoint-url http://localhost:4566 s3 ls s3://kafka-tiered/ --recursive
 
-AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
-aws --region us-east-1 --endpoint-url http://localhost:4566 s3 ls
+# GCS / fake-gcs-server
+curl -s 'http://localhost:4443/storage/v1/b/kafka-tiered/o' | jq '.items[].name'
+
+# Azure / Azurite
+az storage blob list --container-name kafka-tiered \
+  --connection-string "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://localhost:10000/devstoreaccount1;" \
+  --query '[].name' -o tsv
 ```
 
-## Tiered Storage
+## Tiered Storage (Iceberg mode)
 
-Kafka is wired to the Aiven [`RemoteStorageManager`](https://github.com/aiven/tiered-storage-for-apache-kafka) plugin with an S3 backend that points at Floci. Fetch the plugin jars before first `docker compose up`:
+Kafka is wired to the Aiven [`RemoteStorageManager`](https://github.com/Aiven-Open/tiered-storage-for-apache-kafka) plugin in **Iceberg mode** (alpha, v1.1.1). Tiered segments are written as Parquet into an Iceberg table backed by the object store you pick — **AWS S3** (Floci), **GCS** (fake-gcs-server), or **Azure ADLS Gen2** (Azurite) — fronted by an Iceberg REST catalog. Backend is selected via `COMPOSE_FILE` in `server/.env`. Fetch the plugin jars before first `docker compose up`:
 
 ```bash
 cd server/kafka/plugins
 ./fetch.sh
 ```
 
-`create-topic.sh` creates `sensehat` with `remote.storage.enable=true`, 1 MiB segments and 60 s local retention, so segments start shipping to `s3://kafka-tiered/` within a minute of producing. See [TIERED-STORAGE.md](TIERED-STORAGE.md) for the full config reference and troubleshooting.
+`create-topic.sh` creates `sensehat` with `remote.storage.enable=true`, 1 MiB segments and 60 s local retention, so segments start being materialized into the `default.sensehat` Iceberg table within a minute of producing. See [TIERED-STORAGE.md](TIERED-STORAGE.md) for the full config reference and troubleshooting.

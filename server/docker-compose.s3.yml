@@ -1,0 +1,70 @@
+# AWS S3 backend (Floci as the local S3-compatible emulator).
+# Compose overlay: docker compose -f docker-compose.yml -f docker-compose.s3.yml up -d
+
+services:
+  kafka:
+    depends_on:
+      - iceberg-rest
+      - floci
+    environment:
+      "KAFKA_RSM_CONFIG_ICEBERG_CATALOG_IO-IMPL": org.apache.iceberg.aws.s3.S3FileIO
+      KAFKA_RSM_CONFIG_ICEBERG_CATALOG_WAREHOUSE: s3://kafka-tiered/
+      KAFKA_RSM_CONFIG_ICEBERG_CATALOG_S3_ENDPOINT: http://floci:4566
+      "KAFKA_RSM_CONFIG_ICEBERG_CATALOG_S3_PATH-STYLE-ACCESS": "true"
+      "KAFKA_RSM_CONFIG_ICEBERG_CATALOG_S3_ACCESS-KEY-ID": test
+      "KAFKA_RSM_CONFIG_ICEBERG_CATALOG_S3_SECRET-ACCESS-KEY": test
+      KAFKA_RSM_CONFIG_ICEBERG_CATALOG_CLIENT_REGION: us-east-1
+
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.10.0
+    hostname: iceberg-rest
+    container_name: sense-iceberg-rest
+    depends_on:
+      - floci
+      - bucket-init
+    ports:
+      - "8181:8181"
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://kafka-tiered/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://floci:4566
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    restart: unless-stopped
+
+  floci:
+    image: floci/floci:latest
+    hostname: floci
+    container_name: sense-floci
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ${DATA_ROOT:-./data}/floci:/data
+    restart: unless-stopped
+
+  bucket-init:
+    image: amazon/aws-cli:2.17.24
+    container_name: sense-bucket-init
+    depends_on:
+      - floci
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+          aws --endpoint-url http://floci:4566 s3 mb s3://kafka-tiered && break
+          echo "waiting for Floci ($i)..."; sleep 2
+        done
+        aws --endpoint-url http://floci:4566 s3 ls
+    restart: on-failure

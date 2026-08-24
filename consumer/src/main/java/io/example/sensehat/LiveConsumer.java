@@ -1,6 +1,9 @@
 package io.example.sensehat;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import io.confluent.kafka.serializers.AbstractKafkaSchemaSerDeConfig;
+import io.confluent.kafka.serializers.KafkaAvroDeserializer;
+import io.confluent.kafka.serializers.KafkaAvroDeserializerConfig;
+import org.apache.avro.generic.GenericRecord;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
@@ -15,6 +18,7 @@ public final class LiveConsumer {
 
     public static void main(String[] args) throws Exception {
         String broker = env("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092");
+        String schemaRegistry = env("SCHEMA_REGISTRY_URL", "http://localhost:8081");
         String topic = env("KAFKA_TOPIC", "sensehat");
         String group = env("KAFKA_GROUP_ID", "sensehat-live");
 
@@ -24,20 +28,18 @@ public final class LiveConsumer {
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "true");
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
-        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, KafkaAvroDeserializer.class.getName());
+        props.put(AbstractKafkaSchemaSerDeConfig.SCHEMA_REGISTRY_URL_CONFIG, schemaRegistry);
+        props.put(KafkaAvroDeserializerConfig.SPECIFIC_AVRO_READER_CONFIG, false);
 
-        ObjectMapper mapper = new ObjectMapper();
-        ObjectMapper pretty = mapper.copy();
+        System.out.printf("Consuming %s via %s (SR: %s)%n", topic, broker, schemaRegistry);
 
-        System.out.printf("Consuming %s via %s%n", topic, broker);
-
-        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
+        try (KafkaConsumer<String, GenericRecord> consumer = new KafkaConsumer<>(props)) {
             consumer.subscribe(List.of(topic));
             while (!Thread.currentThread().isInterrupted()) {
-                ConsumerRecords<String, String> records = consumer.poll(Duration.ofSeconds(1));
-                for (ConsumerRecord<String, String> record : records) {
-                    Object value = mapper.readValue(record.value(), Object.class);
-                    System.out.println(pretty.writerWithDefaultPrettyPrinter().writeValueAsString(value));
+                ConsumerRecords<String, GenericRecord> records = consumer.poll(Duration.ofSeconds(1));
+                for (ConsumerRecord<String, GenericRecord> record : records) {
+                    System.out.println(record.value());
                 }
             }
         }

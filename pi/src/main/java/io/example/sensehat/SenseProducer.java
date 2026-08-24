@@ -1,35 +1,55 @@
 package io.example.sensehat;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.pi4j.Pi4J;
 import com.pi4j.context.Context;
 import com.pi4j.drivers.hat.raspberry.SenseHat;
+import io.confluent.kafka.serializers.AbstractKafkaSchemaSerDeConfig;
+import io.confluent.kafka.serializers.KafkaAvroSerializer;
+import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.GenericRecord;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.StringSerializer;
 
 import java.net.InetAddress;
-import java.time.Instant;
-import java.util.LinkedHashMap;
-import java.util.Map;
 import java.util.Properties;
 
 public final class SenseProducer {
 
+    private static final String SCHEMA_JSON = """
+            {
+              "type": "record",
+              "namespace": "io.example.sensehat",
+              "name": "SenseReading",
+              "fields": [
+                {"name": "device",        "type": "string"},
+                {"name": "timestamp_ms",  "type": "long", "logicalType": "timestamp-millis"},
+                {"name": "temperature_c", "type": "double"},
+                {"name": "humidity_pct",  "type": "double"},
+                {"name": "pressure_mbar", "type": "double"},
+                {"name": "accel_x",       "type": "double"},
+                {"name": "accel_y",       "type": "double"},
+                {"name": "accel_z",       "type": "double"}
+              ]
+            }
+            """;
+
     public static void main(String[] args) throws Exception {
         String broker = env("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092");
+        String schemaRegistry = env("SCHEMA_REGISTRY_URL", "http://localhost:8081");
         String topic = env("KAFKA_TOPIC", "sensehat");
         long intervalMs = (long) (Double.parseDouble(env("SENSE_INTERVAL_SECONDS", "1")) * 1000);
         String device = env("DEVICE_ID", InetAddress.getLocalHost().getHostName());
 
-        ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
+        Schema schema = new Schema.Parser().parse(SCHEMA_JSON);
 
         Properties props = new Properties();
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, broker);
         props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
-        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class.getName());
+        props.put(AbstractKafkaSchemaSerDeConfig.SCHEMA_REGISTRY_URL_CONFIG, schemaRegistry);
         props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.RETRIES_CONFIG, 10);
 
@@ -37,9 +57,10 @@ public final class SenseProducer {
         SenseHat sense = new SenseHat(pi4j);
         LedStatus led = new LedStatus(sense);
 
-        System.out.printf("Publishing %s readings to %s via %s%n", device, topic, broker);
+        System.out.printf("Publishing %s readings to %s via %s (SR: %s)%n",
+                device, topic, broker, schemaRegistry);
 
-        try (KafkaProducer<String, String> producer = new KafkaProducer<>(props)) {
+        try (KafkaProducer<String, GenericRecord> producer = new KafkaProducer<>(props)) {
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 producer.flush();
                 led.close();
@@ -50,22 +71,20 @@ public final class SenseProducer {
                 double humidity = round(sense.getHumidity(), 2);
                 double pressure = round(sense.getPressure(), 2);
 
-                Map<String, Object> event = new LinkedHashMap<>();
+                GenericRecord event = new GenericData.Record(schema);
                 event.put("device", device);
-                event.put("timestamp", Instant.now().toString());
+                event.put("timestamp_ms", System.currentTimeMillis());
                 event.put("temperature_c", tempC);
                 event.put("humidity_pct", humidity);
                 event.put("pressure_mbar", pressure);
-                event.put("accel", Map.of(
-                        "x", round(accel[0], 4),
-                        "y", round(accel[1], 4),
-                        "z", round(accel[2], 4)));
+                event.put("accel_x", round(accel[0], 4));
+                event.put("accel_y", round(accel[1], 4));
+                event.put("accel_z", round(accel[2], 4));
 
-                String payload = mapper.writeValueAsString(event);
                 try {
-                    producer.send(new ProducerRecord<>(topic, device, payload)).get();
+                    producer.send(new ProducerRecord<>(topic, device, event)).get();
                     led.render(tempC, humidity, pressure);
-                    System.out.println(payload);
+                    System.out.println(event);
                 } catch (Exception e) {
                     led.signalError();
                     System.err.println("send failed: " + e.getMessage());

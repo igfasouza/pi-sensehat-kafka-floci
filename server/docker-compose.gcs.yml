@@ -1,0 +1,68 @@
+# Google Cloud Storage backend (fake-gcs-server as the local GCS emulator).
+# Compose overlay: docker compose -f docker-compose.yml -f docker-compose.gcs.yml up -d
+
+services:
+  kafka:
+    depends_on:
+      - iceberg-rest
+      - gcs
+    environment:
+      "KAFKA_RSM_CONFIG_ICEBERG_CATALOG_IO-IMPL": org.apache.iceberg.gcp.gcs.GCSFileIO
+      KAFKA_RSM_CONFIG_ICEBERG_CATALOG_WAREHOUSE: gs://kafka-tiered/
+      "KAFKA_RSM_CONFIG_ICEBERG_CATALOG_GCS_PROJECT-ID": fake-project
+      "KAFKA_RSM_CONFIG_ICEBERG_CATALOG_GCS_SERVICE_HOST": http://gcs:4443
+      "KAFKA_RSM_CONFIG_ICEBERG_CATALOG_GCS_NO-AUTH": "true"
+
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.10.0
+    hostname: iceberg-rest
+    container_name: sense-iceberg-rest
+    depends_on:
+      - gcs
+      - bucket-init
+    ports:
+      - "8181:8181"
+    environment:
+      CATALOG_WAREHOUSE: gs://kafka-tiered/
+      CATALOG_IO__IMPL: org.apache.iceberg.gcp.gcs.GCSFileIO
+      CATALOG_GCS_PROJECT__ID: fake-project
+      CATALOG_GCS_SERVICE__HOST: http://gcs:4443
+      CATALOG_GCS_NO__AUTH: "true"
+    restart: unless-stopped
+
+  gcs:
+    image: fsouza/fake-gcs-server:1.49.3
+    hostname: gcs
+    container_name: sense-gcs
+    ports:
+      - "4443:4443"
+    command:
+      - -scheme=http
+      - -host=0.0.0.0
+      - -port=4443
+      - -public-host=gcs:4443
+      - -external-url=http://gcs:4443
+      - -data=/data
+    volumes:
+      - ${DATA_ROOT:-./data}/gcs:/data
+    restart: unless-stopped
+
+  bucket-init:
+    image: curlimages/curl:8.10.1
+    container_name: sense-bucket-init
+    depends_on:
+      - gcs
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d '{"name":"kafka-tiered"}' \
+            'http://gcs:4443/storage/v1/b?project=fake-project' && break
+          echo "waiting for fake-gcs ($i)..."; sleep 2
+        done
+        echo
+        curl -fsS 'http://gcs:4443/storage/v1/b?project=fake-project'
+        echo
+    restart: on-failure

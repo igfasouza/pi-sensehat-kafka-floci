@@ -1,30 +1,59 @@
-# Kafka Tiered Storage -> Floci S3
+# Kafka Tiered Storage -> Iceberg (Aiven, alpha)
 
-Wires Apache Kafka's tiered-storage feature to the Aiven `RemoteStorageManager` plugin (S3 backend), pointed at the local Floci S3 endpoint.
+Wires Apache Kafka's tiered-storage feature to the Aiven `RemoteStorageManager`
+plugin in **Iceberg mode** (alpha, added in
+[v1.1.1](https://github.com/Aiven-Open/tiered-storage-for-apache-kafka/releases/tag/v1.1.1)).
+Tiered segments are materialized as Parquet files inside an Iceberg table,
+served by a REST catalog and stored on the object-store backend of your choice
+(**AWS S3**, **GCS** or **Azure ADLS Gen2**).
+
+Values on the topic must be **Avro** — the RSM uses the schema registered in
+Karapace to build the Iceberg schema.
 
 ## 1. Fetch the plugin jars
 
-Runs Maven on the host to pull `io.aiven:tiered-storage-for-apache-kafka-core` + `...-s3` and all transitive runtime jars into `server/kafka/plugins/tiered-storage/`, which the Kafka container mounts read-only at `/opt/kafka/plugins/tiered-storage`.
+The Aiven release tarballs are attached to the GitHub release (not on Maven
+Central). The Iceberg GCS/Azure SDK bundles come from Maven Central. `fetch.sh`
+downloads all of them into `server/kafka/plugins/tiered-storage/`:
 
 ```bash
 cd server/kafka/plugins
 ./fetch.sh
 ```
 
-The plugin version is pinned in [server/kafka/plugins/pom.xml](server/kafka/plugins/pom.xml) via `tiered.storage.version`. Bump it and re-run `fetch.sh` to upgrade.
+## 2. Pick a backend and start the stack
 
-## 2. Start the stack
+The stack is split into a base compose file and one overlay per cloud, selected
+via `COMPOSE_FILE` in `.env`:
 
 ```bash
 cd server
 cp .env.example .env
+# edit .env to pick s3 / gcs / azure
 docker compose up -d
 ```
 
-The `bucket-init` service waits for Floci and creates `s3://kafka-tiered`. If you already had the stack running, restart Kafka so it picks up the tiered-storage env vars:
+| Backend | Overlay file           | Emulator                        | Warehouse URI                                                          |
+|---------|------------------------|---------------------------------|------------------------------------------------------------------------|
+| AWS S3  | `docker-compose.s3.yml`    | Floci (`:4566`)                | `s3://kafka-tiered/`                                                   |
+| GCS     | `docker-compose.gcs.yml`   | fake-gcs-server (`:4443`)      | `gs://kafka-tiered/`                                                   |
+| Azure   | `docker-compose.azure.yml` | Azurite (`:10000`)             | `abfss://kafka-tiered@devstoreaccount1.dfs.core.windows.net/`          |
+
+Common to every backend: Kafka on `:9092`, Karapace (Schema Registry) on
+`:8081`, Iceberg REST catalog on `:8181`.
+
+To switch backends:
 
 ```bash
-docker compose up -d --force-recreate kafka
+docker compose down -v            # wipe local state (metadata is per-backend)
+# edit COMPOSE_FILE in .env
+docker compose up -d
+```
+
+If you just want to hot-swap without editing `.env`:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gcs.yml up -d
 ```
 
 ## 3. Create the topic with remote storage enabled
@@ -33,32 +62,47 @@ docker compose up -d --force-recreate kafka
 ./scripts/create-topic.sh
 ```
 
-The script sets:
+Same tiered-storage config regardless of backend:
 
-- `remote.storage.enable=true`  — this segment stream ships to S3
-- `segment.bytes=1 MiB`         — tiny segments so tiering triggers fast in the lab
-- `local.retention.ms=60000`    — keep 1 minute on the broker's local disk
-- `retention.ms=-1`             — keep forever in remote storage
+- `remote.storage.enable=true`
+- `segment.bytes=1 MiB`
+- `local.retention.ms=60000`
+- `retention.ms=-1`
 
 ## 4. Verify
 
-Produce some events (`pi/`), then wait ~60 s and check the bucket:
+Produce with `pi/` (Avro via Karapace), wait ~60 s, and hit the REST catalog:
 
 ```bash
-AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
-aws --region us-east-1 --endpoint-url http://localhost:4566 \
-    s3 ls s3://kafka-tiered/ --recursive
+curl -s http://localhost:8181/v1/namespaces/default/tables | jq
 ```
 
-You should see per-partition prefixes and uploaded segment/index chunks. Broker logs will show `RemoteLogManager` copying segments; grep for `Copied` or `remote-log`:
+You should see a table per tiered partition. Broker logs:
 
 ```bash
-docker logs sense-kafka 2>&1 | grep -i remote
+docker logs sense-kafka 2>&1 | grep -iE 'iceberg|remote'
+```
+
+Backend-specific checks:
+
+```bash
+# S3 / Floci
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+  aws --region us-east-1 --endpoint-url http://localhost:4566 \
+      s3 ls s3://kafka-tiered/ --recursive
+
+# GCS / fake-gcs-server
+curl -s 'http://localhost:4443/storage/v1/b/kafka-tiered/o' | jq '.items[].name'
+
+# Azure / Azurite
+az storage blob list --container-name kafka-tiered \
+  --connection-string "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://localhost:10000/devstoreaccount1;" \
+  --query '[].name' -o tsv
 ```
 
 ## Broker configuration reference
 
-All wired via `KAFKA_*` env vars in [server/docker-compose.yml](server/docker-compose.yml). Translated back to `server.properties`:
+The cloud-neutral bits live in [server/docker-compose.yml](server/docker-compose.yml):
 
 ```properties
 remote.log.storage.system.enable=true
@@ -66,24 +110,60 @@ remote.log.storage.manager.class.name=io.aiven.kafka.tieredstorage.RemoteStorage
 remote.log.storage.manager.class.path=/opt/kafka/plugins/tiered-storage/*
 remote.log.storage.manager.impl.prefix=rsm.config.
 
-remote.log.metadata.manager.class.name=org.apache.kafka.server.log.remote.metadata.storage.TopicBasedRemoteLogMetadataManager
-remote.log.metadata.manager.listener.name=PLAINTEXT
-rlmm.config.remote.log.metadata.topic.replication.factor=1
-rlmm.config.remote.log.metadata.topic.num.partitions=5
-
 rsm.config.chunk.size=4194304
-rsm.config.storage.backend.class=io.aiven.kafka.tieredstorage.storage.s3.S3Storage
-rsm.config.storage.s3.bucket.name=kafka-tiered
-rsm.config.storage.s3.region=us-east-1
-rsm.config.storage.s3.endpoint.url=http://floci:4566
-rsm.config.storage.s3.path.style.access.enabled=true
-rsm.config.storage.aws.access.key.id=test
-rsm.config.storage.aws.secret.access.key=test
+rsm.config.storage.backend.class=io.aiven.kafka.tieredstorage.storage.filesystem.FileSystemStorage
+rsm.config.storage.root=/tmp/tiered-stub
+rsm.config.structure.provider.class=io.aiven.kafka.tieredstorage.iceberg.AvroSchemaRegistryStructureProvider
+rsm.config.structure.provider.serde.schema.registry.url=http://karapace:8081
+rsm.config.segment.format=iceberg
+rsm.config.iceberg.namespace=default
+rsm.config.iceberg.catalog.class=org.apache.iceberg.rest.RESTCatalog
+rsm.config.iceberg.catalog.uri=http://iceberg-rest:8181
+```
+
+Backend-specific bits (from each overlay):
+
+**S3** — `docker-compose.s3.yml`
+
+```properties
+rsm.config.iceberg.catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+rsm.config.iceberg.catalog.warehouse=s3://kafka-tiered/
+rsm.config.iceberg.catalog.s3.endpoint=http://floci:4566
+rsm.config.iceberg.catalog.s3.path-style-access=true
+rsm.config.iceberg.catalog.s3.access-key-id=test
+rsm.config.iceberg.catalog.s3.secret-access-key=test
+rsm.config.iceberg.catalog.client.region=us-east-1
+```
+
+**GCS** — `docker-compose.gcs.yml`
+
+```properties
+rsm.config.iceberg.catalog.io-impl=org.apache.iceberg.gcp.gcs.GCSFileIO
+rsm.config.iceberg.catalog.warehouse=gs://kafka-tiered/
+rsm.config.iceberg.catalog.gcs.project-id=fake-project
+rsm.config.iceberg.catalog.gcs.service.host=http://gcs:4443
+rsm.config.iceberg.catalog.gcs.no-auth=true
+```
+
+**Azure** — `docker-compose.azure.yml`
+
+```properties
+rsm.config.iceberg.catalog.io-impl=org.apache.iceberg.azure.adlsv2.ADLSFileIO
+rsm.config.iceberg.catalog.warehouse=abfss://kafka-tiered@devstoreaccount1.dfs.core.windows.net/
+rsm.config.iceberg.catalog.adls.connection-string.devstoreaccount1=DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=<well-known-key>;BlobEndpoint=http://azurite:10000/devstoreaccount1;
 ```
 
 ## Notes / caveats
 
-- Replication factor 1 for the metadata topic is fine for a single-broker lab; production needs ≥3.
-- The plugin exposes many more knobs (encryption, chunk cache, compression, fetch chunk cache size). See the [Aiven plugin docs](https://github.com/aiven/tiered-storage-for-apache-kafka) for the full list.
-- If Kafka logs `NoClassDefFoundError` for AWS SDK classes, the `fetch.sh` step didn't pull transitive deps — re-run it and confirm the `tiered-storage/` directory has 40+ jars.
-- Property names above match the pinned plugin version. Verify against release notes before bumping `tiered.storage.version`.
+- **Alpha feature.** No schema evolution, no Kafka transactions, no per-topic
+  config, possible duplicate visibility on replication. Fine for the lab.
+- Values must be Avro. Non-Avro will break the RSM copy phase.
+- Replication factor 1 for the metadata topic is fine here; production needs ≥3.
+- **Azurite** only partially implements the ADLS Gen2 DFS API. The smoke path
+  works, but some HNS-specific ops may fail — swap for a real account when
+  going beyond the lab.
+- If Kafka logs `NoClassDefFoundError`, `fetch.sh` didn't unpack the tarballs.
+  Confirm `tiered-storage/` has 50+ jars (iceberg-*, parquet-*, hadoop-common,
+  kafka-avro-serializer, iceberg-gcp-bundle, iceberg-azure-bundle).
+- Bumping backends re-uses the same Kafka data dir. If you switch backends and
+  see stale-metadata errors, `docker compose down -v` and rebuild.
